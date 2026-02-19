@@ -32,6 +32,7 @@ use imap_next::{
     },
 };
 use rip_starttls::imap::tokio::RipStarttls;
+#[cfg(feature = "platform-verifier")]
 use rustls_platform_verifier::ConfigVerifierExt;
 use thiserror::Error;
 use tokio::{
@@ -236,62 +237,86 @@ impl Client {
     /// If `false`: upgrades straight to TLS, receives greeting then
     /// refreshes server capabilities if needed.
     async fn upgrade_rustls(
-        mut self,
-        starttls: bool,
-        cert: Option<PathBuf>,
-    ) -> Result<Self, ClientError> {
-        let MaybeTlsStream::Plain(mut tcp_stream) = self.stream.into_inner() else {
-            return Err(ClientError::ClientAlreadyTlsError);
+    mut self,
+    starttls: bool,
+    cert: Option<PathBuf>,
+) -> Result<Self, ClientError> {
+    let MaybeTlsStream::Plain(mut tcp_stream) = self.stream.into_inner() else {
+        return Err(ClientError::ClientAlreadyTlsError);
+    };
+
+    if starttls {
+        tcp_stream = RipStarttls::default()
+            .do_starttls_prefix(tcp_stream)
+            .await
+            .map_err(ClientError::DoStarttlsPrefixError)?;
+    }
+
+    // --- TLS CONFIG ---------------------------------------------------------
+
+    let mut config: ClientConfig = if let Some(pem_path) = cert {
+        let pem = fs::read(&pem_path).await?;
+
+        let Some(cert) = CertificateDer::pem_slice_iter(&pem).next() else {
+            return Err(ClientError::EmptyCert(pem_path));
         };
 
-        if starttls {
-            tcp_stream = RipStarttls::default()
-                .do_starttls_prefix(tcp_stream)
-                .await
-                .map_err(ClientError::DoStarttlsPrefixError)?;
+        let cert = match cert {
+            Ok(cert) => cert,
+            Err(err) => return Err(ClientError::InvalidCert(err, pem_path)),
+        };
+
+        let verifier = FingerprintVerifier::new(&cert);
+
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth()
+    } else {
+        #[cfg(feature = "platform-verifier")]
+        {
+            ClientConfig::with_platform_verifier()
+                .map_err(ClientError::TlsConfig)?
         }
 
-        let mut config = if let Some(pem_path) = cert {
-            let pem = fs::read(&pem_path).await?;
+        #[cfg(not(feature = "platform-verifier"))]
+        {
+            use tokio_rustls::rustls::RootCertStore;
+            use webpki_roots::TLS_SERVER_ROOTS;
 
-            let Some(cert) = CertificateDer::pem_slice_iter(&pem).next() else {
-                return Err(ClientError::EmptyCert(pem_path));
-            };
-
-            let cert = match cert {
-                Ok(cert) => cert,
-                Err(err) => return Err(ClientError::InvalidCert(err, pem_path)),
-            };
-
-            let verifier = FingerprintVerifier::new(&cert);
+            let mut roots = RootCertStore::empty();
+            roots.extend(TLS_SERVER_ROOTS.iter().cloned());
 
             ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_root_certificates(roots)
                 .with_no_client_auth()
-        } else {
-            ClientConfig::with_platform_verifier().map_err(ClientError::TlsConfig)?
-        };
-
-        // See <https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids>
-        config.alpn_protocols = vec![b"imap".to_vec()];
-
-        let connector = TlsConnector::from(Arc::new(config));
-        let dnsname = ServerName::try_from(self.host.clone()).unwrap();
-
-        let tls_stream = connector
-            .connect(dnsname, tcp_stream)
-            .await
-            .map_err(ClientError::ConnectToTlsStreamError)?;
-
-        self.stream = Stream::new(MaybeTlsStream::Rustls(tls_stream));
-
-        if starttls || !self.receive_greeting().await? {
-            self.refresh_capabilities().await?;
         }
+    };
 
-        Ok(self)
+    // ALPN
+    config.alpn_protocols = vec![b"imap".to_vec()];
+
+    // --- CONNECT ------------------------------------------------------------
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let dnsname = ServerName::try_from(self.host.clone())
+        .map_err(|_| ClientError::ConnectToTlsStreamError(
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid dns name")
+        ))?;
+
+    let tls_stream = connector
+        .connect(dnsname, tcp_stream)
+        .await
+        .map_err(ClientError::ConnectToTlsStreamError)?;
+
+    self.stream = Stream::new(MaybeTlsStream::Rustls(tls_stream));
+
+    if starttls || !self.receive_greeting().await? {
+        self.refresh_capabilities().await?;
     }
+
+    Ok(self)
+}
 
     /// Receives server greeting.
     ///
